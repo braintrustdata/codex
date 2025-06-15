@@ -18,6 +18,11 @@ use std::path::PathBuf;
 use tracing_appender::non_blocking;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
+use tracing_opentelemetry::OpenTelemetryLayer;
+use opentelemetry::sdk::trace as sdktrace;
+use opentelemetry::sdk::Resource;
+use opentelemetry::KeyValue;
+use opentelemetry_otlp::WithExportConfig;
 
 mod app;
 mod app_event;
@@ -44,6 +49,24 @@ mod tui;
 mod user_approval_widget;
 
 pub use cli::Cli;
+
+fn otel_layer() -> Option<OpenTelemetryLayer<tracing_subscriber::Registry, sdktrace::Tracer>> {
+    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
+    let tracer = opentelemetry_otlp::new_exporter()
+        .http()
+        .with_endpoint(endpoint)
+        .into_pipeline()
+        .tracing()
+        .with_trace_config(
+            sdktrace::config().with_resource(Resource::new(vec![KeyValue::new(
+                "service.name",
+                "codex",
+            )])),
+        )
+        .install_simple()
+        .ok()?;
+    Some(tracing_opentelemetry::layer().with_tracer(tracer))
+}
 
 pub fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> std::io::Result<()> {
     let (sandbox_policy, approval_policy) = if cli.full_auto {
@@ -124,10 +147,18 @@ pub fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> std::io::
     let (log_tx, log_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let tui_layer = TuiLogLayer::new(log_tx.clone(), 120).with_filter(env_filter());
 
-    let _ = tracing_subscriber::registry()
-        .with(file_layer)
-        .with(tui_layer)
-        .try_init();
+    if let Some(otel) = otel_layer() {
+        let _ = tracing_subscriber::registry()
+            .with(file_layer)
+            .with(tui_layer)
+            .with(otel)
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::registry()
+            .with(file_layer)
+            .with(tui_layer)
+            .try_init();
+    }
 
     let show_login_screen = should_show_login_screen(&config);
 
@@ -138,6 +169,7 @@ pub fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> std::io::
     let show_git_warning = !cli.skip_git_repo_check && !is_inside_git_repo(&config);
 
     try_run_ratatui_app(cli, config, show_login_screen, show_git_warning, log_rx);
+    opentelemetry::global::shutdown_tracer_provider();
     Ok(())
 }
 
