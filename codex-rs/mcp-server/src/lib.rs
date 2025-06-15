@@ -13,6 +13,12 @@ use tokio::sync::mpsc;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
+use tracing_subscriber::prelude::*;
+use tracing_opentelemetry::OpenTelemetryLayer;
+use opentelemetry::sdk::trace as sdktrace;
+use opentelemetry::sdk::Resource;
+use opentelemetry::KeyValue;
+use opentelemetry_otlp::WithExportConfig;
 
 mod codex_tool_config;
 mod codex_tool_runner;
@@ -26,12 +32,38 @@ use crate::message_processor::MessageProcessor;
 /// plenty for an interactive CLI.
 const CHANNEL_CAPACITY: usize = 128;
 
+fn otel_layer() -> Option<OpenTelemetryLayer<tracing_subscriber::Registry, sdktrace::Tracer>> {
+    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
+    let tracer = opentelemetry_otlp::new_exporter()
+        .http()
+        .with_endpoint(endpoint)
+        .into_pipeline()
+        .tracing()
+        .with_trace_config(
+            sdktrace::config().with_resource(Resource::new(vec![KeyValue::new(
+                "service.name",
+                "codex",
+            )])),
+        )
+        .install_simple()
+        .ok()?;
+    Some(tracing_opentelemetry::layer().with_tracer(tracer))
+}
+
 pub async fn run_main(codex_linux_sandbox_exe: Option<PathBuf>) -> IoResult<()> {
     // Install a simple subscriber so `tracing` output is visible.  Users can
     // control the log level with `RUST_LOG`.
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .init();
+    let fmt_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+    if let Some(otel) = otel_layer() {
+        tracing_subscriber::registry()
+            .with(fmt_layer)
+            .with(otel)
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(fmt_layer)
+            .init();
+    }
 
     // Set up channels.
     let (incoming_tx, mut incoming_rx) = mpsc::channel::<JSONRPCMessage>(CHANNEL_CAPACITY);
@@ -111,5 +143,6 @@ pub async fn run_main(codex_linux_sandbox_exe: Option<PathBuf>) -> IoResult<()> 
     // the processor and then to the stdout task.
     let _ = tokio::join!(stdin_reader_handle, processor_handle, stdout_writer_handle);
 
+    opentelemetry::global::shutdown_tracer_provider();
     Ok(())
 }

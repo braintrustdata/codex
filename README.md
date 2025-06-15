@@ -477,6 +477,9 @@ export OPENROUTER_API_KEY="your-openrouter-key-here"
 # Similarly for other providers
 ```
 
+To export tracing spans via OpenTelemetry, set `OTEL_EXPORTER_OTLP_ENDPOINT`
+to your collector's endpoint URL. When present, Codex will emit OTLP traces.
+
 ---
 
 ## FAQ

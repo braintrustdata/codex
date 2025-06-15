@@ -24,6 +24,30 @@ use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
+use tracing_opentelemetry::OpenTelemetryLayer;
+use opentelemetry::sdk::trace as sdktrace;
+use opentelemetry::sdk::Resource;
+use opentelemetry::KeyValue;
+use opentelemetry_otlp::WithExportConfig;
+
+fn otel_layer() -> Option<OpenTelemetryLayer<tracing_subscriber::Registry, sdktrace::Tracer>> {
+    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
+    let tracer = opentelemetry_otlp::new_exporter()
+        .http()
+        .with_endpoint(endpoint)
+        .into_pipeline()
+        .tracing()
+        .with_trace_config(
+            sdktrace::config().with_resource(Resource::new(vec![KeyValue::new(
+                "service.name",
+                "codex",
+            )])),
+        )
+        .install_simple()
+        .ok()?;
+    Some(tracing_opentelemetry::layer().with_tracer(tracer))
+}
 
 pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()> {
     let Cli {
@@ -125,17 +149,27 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
 
     // TODO(mbolin): Take a more thoughtful approach to logging.
     let default_level = "error";
-    let _ = tracing_subscriber::fmt()
+    let fmt_layer = tracing_subscriber::fmt::layer()
         // Fallback to the `default_level` log filter if the environment
         // variable is not set _or_ contains an invalid value
-        .with_env_filter(
+        .with_filter(
             EnvFilter::try_from_default_env()
                 .or_else(|_| EnvFilter::try_new(default_level))
                 .unwrap_or_else(|_| EnvFilter::new(default_level)),
         )
         .with_ansi(stderr_with_ansi)
-        .with_writer(std::io::stderr)
-        .try_init();
+        .with_writer(std::io::stderr);
+
+    if let Some(otel) = otel_layer() {
+        let _ = tracing_subscriber::registry()
+            .with(fmt_layer)
+            .with(otel)
+            .try_init();
+    } else {
+        let _ = tracing_subscriber::registry()
+            .with(fmt_layer)
+            .try_init();
+    }
 
     let (codex_wrapper, event, ctrl_c) = codex_wrapper::init_codex(config).await?;
     let codex = Arc::new(codex_wrapper);
@@ -220,6 +254,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         }
     }
 
+    opentelemetry::global::shutdown_tracer_provider();
     Ok(())
 }
 
