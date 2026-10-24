@@ -1106,7 +1106,7 @@ fn extract_zipball_to_dir(bytes: &[u8], destination: &Path) -> Result<(), String
 }
 
 #[cfg(unix)]
-fn apply_zip_permissions(entry: &zip::read::ZipFile<'_>, output_path: &Path) -> Result<(), String> {
+fn apply_zip_permissions(entry: &zip::read::ZipFile<'_, impl std::io::Read>, output_path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
 
     let Some(mode) = entry.unix_mode() else {
@@ -1122,7 +1122,7 @@ fn apply_zip_permissions(entry: &zip::read::ZipFile<'_>, output_path: &Path) -> 
 
 #[cfg(not(unix))]
 fn apply_zip_permissions(
-    _entry: &zip::read::ZipFile<'_>,
+    _entry: &zip::read::ZipFile<'_, impl std::io::Read>,
     _output_path: &Path,
 ) -> Result<(), String> {
     Ok(())
