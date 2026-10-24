@@ -59,7 +59,7 @@ fn blocking_transport_preserves_wire_format_and_buffered_frames() -> io::Result<
     {
         let mut output = blocking_writer(&mut bytes);
         for payload in payloads {
-            block_on(output.send(payload.to_vec().into()))?;
+            block_on(output.send(tokio_util::bytes::Bytes::copy_from_slice(payload)))?;
         }
     }
     assert_eq!(bytes, b"\x03\0\0\0abc\0\0\0\0\x03\0\0\0hi\0");
