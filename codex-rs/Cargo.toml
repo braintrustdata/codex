@@ -520,7 +520,7 @@ supports-color = "3.0.2"
 syntect = "5"
 sys-locale = "0.3.2"
 system-configuration = "0.7"
-tar = { version = "=0.4.45", default-features = false }
+tar = { version = "=0.4.46", default-features = false }
 tempfile = "3.23.0"
 test-log = "0.2.19"
 textwrap = "0.16.2"
@@ -668,6 +668,7 @@ inherits = "test"
 opt-level = 0
 
 [patch.crates-io]
+starlark = { path = "../third_party/starlark" }
 # Uncomment to debug local changes.
 # ratatui = { path = "../../ratatui" }
 crossterm = { git = "https://github.com/openai-oss-forks/crossterm", rev = "ed1cdab335221515706178d68495bba2aed1924f" }
