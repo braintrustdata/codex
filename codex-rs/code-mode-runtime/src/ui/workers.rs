@@ -30,6 +30,7 @@ use futures::StreamExt;
 use futures::executor::block_on;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
+use tokio_util::bytes::Bytes;
 
 // Every instance reserves space for its turns and one close; output also reserves
 // one slot for a rejected open.
@@ -51,7 +52,8 @@ pub(super) fn run() -> io::Result<()> {
         .name("ui-plugin-output".into())
         .spawn(move || {
             let mut writer = blocking_writer(io::stdout().lock());
-            if let Err(error) = block_on(writer.send(codex_plugin_host::READY.to_vec().into())) {
+            if let Err(error) = block_on(writer.send(Bytes::from_static(codex_plugin_host::READY)))
+            {
                 fatal(error);
             }
             for output in outgoing_rx {
@@ -62,7 +64,7 @@ pub(super) fn run() -> io::Result<()> {
                 for packet in &output.packets {
                     let bytes =
                         serde_json::to_vec(packet).unwrap_or_else(|error| fatal(error.into()));
-                    if let Err(error) = block_on(writer.send(bytes.into())) {
+                    if let Err(error) = block_on(writer.send(Bytes::from(bytes))) {
                         fatal(error);
                     }
                 }
