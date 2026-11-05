@@ -266,6 +266,19 @@ impl CodexThread {
             .map(|_| ())
     }
 
+    pub async fn import_code_mode_state(
+        &self,
+        state: codex_code_mode::CodeModeSnapshot,
+    ) -> Result<(), String> {
+        self.session
+            .services
+            .code_mode_service
+            .session()
+            .await?
+            .import_state(state)
+            .await
+    }
+
     pub async fn submit(&self, op: Op) -> CodexResult<String> {
         self.submit_with_trace(op, /*trace*/ None).await
     }
