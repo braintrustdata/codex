@@ -267,3 +267,193 @@ async fn drop_terminates_cells_when_the_registry_is_locked() {
         .unwrap();
     assert!(inner.cell_tasks.is_empty());
 }
+
+#[tokio::test]
+async fn stored_values_transfer_to_independent_fresh_runtimes() {
+    let source = SessionRuntime::new();
+    let started = source
+        .execute(
+            execute_request(r#"store("value", {n: 7, values: [null, true, "雪"]});"#),
+            ObserveMode::YieldAfter(Duration::from_secs(1)),
+            Arc::new(RecordingDelegate),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        started.initial_event().await.unwrap(),
+        CellEvent::Completed {
+            error_text: None,
+            ..
+        }
+    ));
+    source.inner.cell_tasks.wait().await;
+    let snapshot = source.export_state().await.unwrap();
+    assert_eq!(snapshot.next_cell_id, 2);
+    source.shutdown().await.unwrap();
+    drop(source);
+    let left = SessionRuntime::new();
+    let right = SessionRuntime::new();
+    left.import_state(snapshot.clone()).await.unwrap();
+    right.import_state(snapshot).await.unwrap();
+    for (runtime, source, expected) in [
+        (
+            &left,
+            r#"store("value", "left"); text(load("value"));"#,
+            "left",
+        ),
+        (&right, r#"text(load("value").n);"#, "7"),
+    ] {
+        let cell = runtime
+            .execute(
+                execute_request(source),
+                ObserveMode::YieldAfter(Duration::from_secs(1)),
+                Arc::new(RecordingDelegate),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cell.cell_id.as_str(), "2");
+        assert_eq!(
+            cell.initial_event().await.unwrap(),
+            CellEvent::Completed {
+                content_items: vec![OutputItem::Text {
+                    text: expected.to_string()
+                }],
+                error_text: None,
+            }
+        );
+        runtime.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn busy_export_does_not_cancel_or_consume_the_source_cell() {
+    let runtime = SessionRuntime::new();
+    let started = runtime
+        .execute(
+            execute_request("yield_control(); await new Promise(() => {});"),
+            ObserveMode::YieldAfter(Duration::from_secs(1)),
+            Arc::new(RecordingDelegate),
+        )
+        .await
+        .unwrap();
+    let id = started.cell_id.clone();
+    assert!(matches!(
+        started.initial_event().await.unwrap(),
+        CellEvent::Yielded { .. }
+    ));
+    assert!(
+        runtime
+            .export_state()
+            .await
+            .unwrap_err()
+            .contains("active cells")
+    );
+    assert!(matches!(
+        runtime
+            .observe(&id, ObserveMode::YieldAfter(Duration::ZERO))
+            .await
+            .unwrap(),
+        CellEvent::Yielded { .. }
+    ));
+    assert!(matches!(
+        runtime.terminate(&id).await.unwrap(),
+        CellEvent::Terminated { .. }
+    ));
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn buffered_terminal_observation_survives_state_transfer_once() {
+    let source = SessionRuntime::new();
+    let started = source
+        .execute(
+            execute_request(r#"yield_control(); store("done", true); text("buffered");"#),
+            ObserveMode::YieldAfter(Duration::from_secs(1)),
+            Arc::new(RecordingDelegate),
+        )
+        .await
+        .unwrap();
+    let id = started.cell_id.clone();
+    assert!(matches!(
+        started.initial_event().await.unwrap(),
+        CellEvent::Yielded { .. }
+    ));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !source.inner.stored_values.lock().await.contains_key("done") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let snapshot = source.export_state().await.unwrap();
+    assert!(snapshot.completed_cells.contains_key(id.as_str()));
+    let target = SessionRuntime::new();
+    target.import_state(snapshot).await.unwrap();
+    source.shutdown().await.unwrap();
+    assert_eq!(
+        target
+            .observe(&id, ObserveMode::YieldAfter(Duration::ZERO))
+            .await
+            .unwrap(),
+        CellEvent::Completed {
+            content_items: vec![OutputItem::Text {
+                text: "buffered".to_string()
+            }],
+            error_text: None,
+        }
+    );
+    assert!(matches!(
+        target
+            .observe(&id, ObserveMode::YieldAfter(Duration::ZERO))
+            .await,
+        Err(Error::MissingCell(_))
+    ));
+    target.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn malformed_import_leaves_receiver_fresh_and_used_receiver_intact() {
+    let runtime = SessionRuntime::new();
+    let mut snapshot = codex_code_mode_protocol::CodeModeSnapshot {
+        format_version: 2,
+        next_cell_id: 3,
+        stored_values: HashMap::from([("value".to_string(), serde_json::json!(7))]),
+        completed_cells: HashMap::new(),
+    };
+    assert!(runtime.import_state(snapshot.clone()).await.is_err());
+    assert!(
+        runtime
+            .export_state()
+            .await
+            .unwrap()
+            .stored_values
+            .is_empty()
+    );
+    snapshot.format_version = 1;
+    runtime.import_state(snapshot.clone()).await.unwrap();
+    snapshot
+        .stored_values
+        .insert("value".to_string(), serde_json::json!(8));
+    assert!(runtime.import_state(snapshot).await.is_err());
+    assert_eq!(
+        runtime.export_state().await.unwrap().stored_values["value"],
+        serde_json::json!(7)
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn snapshot_preserves_restored_public_terminal_identity() {
+    let runtime = super::SessionRuntime::new();
+    let snapshot: codex_code_mode_protocol::CodeModeSnapshot =
+        serde_json::from_value(serde_json::json!({
+            "format_version": 1, "next_cell_id": 2, "stored_values": {},
+            "completed_cells": { "1": {
+                "public_cell_id": "g2:1", "pending_initial_yield_items": null,
+                "event": { "Completed": { "content_items": [], "error_text": null } }
+            } }
+        }))
+        .unwrap();
+    runtime.import_state(snapshot.clone()).await.unwrap();
+    assert_eq!(runtime.export_state().await.unwrap(), snapshot);
+}

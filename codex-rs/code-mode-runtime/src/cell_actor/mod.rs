@@ -27,6 +27,7 @@ pub(crate) use self::types::CellHandle;
 pub(crate) use self::types::CellHost;
 pub(crate) use self::types::CellState;
 pub(crate) use self::types::CellToolCall;
+pub(crate) use self::types::CompletedCellSnapshot;
 pub(crate) use self::types::CompletionCommit;
 use self::types::CompletionDelivery;
 use self::types::ObservationDelivery;

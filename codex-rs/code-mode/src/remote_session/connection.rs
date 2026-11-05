@@ -209,9 +209,15 @@ impl Connection {
                 .map_err(|error| error.to_string())?;
             let yield_capability =
                 Capability::new(YIELD_OBSERVATION_CAPABILITY).map_err(|error| error.to_string())?;
-            let optional_capabilities =
-                CapabilitySet::try_new([session_limits_capability, yield_capability])
+            let state_capability =
+                Capability::new(codex_code_mode_protocol::host::STATE_TRANSFER_CAPABILITY)
                     .map_err(|error| error.to_string())?;
+            let optional_capabilities = CapabilitySet::try_new([
+                session_limits_capability,
+                yield_capability,
+                state_capability,
+            ])
+            .map_err(|error| error.to_string())?;
             let hello = ClientHello::new(
                 SupportedProtocolVersions::try_new([ProtocolVersion::V1])
                     .map_err(|err| err.to_string())?,
@@ -449,14 +455,85 @@ impl Connection {
         .await
     }
 
-    pub(super) async fn shutdown_session(&self, session: RemoteSession) -> Result<(), String> {
+    fn require_state_transfer(&self) -> Result<(), String> {
+        if !self.capabilities.iter().any(|capability| {
+            capability.as_str() == codex_code_mode_protocol::host::STATE_TRANSFER_CAPABILITY
+        }) {
+            return Err("code-mode host does not support settled state transfer".to_string());
+        }
+        Ok(())
+    }
+
+    pub(super) async fn export_state(
+        &self,
+        session: RemoteSession,
+    ) -> Result<codex_code_mode_protocol::CodeModeSnapshot, String> {
+        self.require_state_transfer()?;
         let (response_tx, response_rx) = oneshot::channel();
-        self.send(DriverCommand::ShutdownSession {
-            session,
-            response_tx,
+        // A transfer observation deadline does not prove the shared host failed.
+        tokio::time::timeout(DEFAULT_HOST_WAIT_TRANSPORT_TIMEOUT, async {
+            self.send(DriverCommand::ExportState {
+                session,
+                response_tx,
+            })
+            .await?;
+            self.receive(response_rx).await
         })
-        .await?;
-        self.receive(response_rx).await
+        .await
+        .map_err(|_| "code-mode state export timed out".to_string())?
+    }
+
+    pub(super) async fn import_state(
+        &self,
+        session: RemoteSession,
+        state: codex_code_mode_protocol::CodeModeSnapshot,
+    ) -> Result<(), String> {
+        self.require_state_transfer()?;
+        let (response_tx, response_rx) = oneshot::channel();
+        // The existing import owner joins this receiver on error or cancellation.
+        // Keep unrelated published sessions alive when only this reply is late.
+        tokio::time::timeout(DEFAULT_HOST_WAIT_TRANSPORT_TIMEOUT, async {
+            self.send(DriverCommand::ImportState {
+                session,
+                state,
+                response_tx,
+            })
+            .await?;
+            self.receive(response_rx).await
+        })
+        .await
+        .map_err(|_| "code-mode state import timed out".to_string())?
+    }
+
+    pub(super) async fn shutdown_session(
+        &self,
+        session: RemoteSession,
+        cleanup: SessionCleanup,
+    ) -> Result<(), String> {
+        let (response_tx, response_rx) = oneshot::channel();
+        if self
+            .send(DriverCommand::ShutdownSession {
+                session: session.clone(),
+                cleanup: cleanup.clone(),
+                response_tx,
+            })
+            .await
+            .is_ok()
+        {
+            if let Ok(Err(error)) = response_rx.await {
+                // An explicit rejected admission never authorizes another
+                // receipt to join; transport errors instead join below.
+                return Err(error);
+            }
+        }
+        // Transport death cannot prove successful retirement. Even if it precedes
+        // shutdown entry, join the exact receipt and inspect its acknowledgement.
+        cleanup.wait().await;
+        if cleanup.acknowledged_for(&session) {
+            Ok(())
+        } else {
+            Err(self.failure_message())
+        }
     }
 
     async fn with_transport_deadline<T>(
@@ -496,7 +573,7 @@ impl Connection {
         response_rx.await.map_err(|_| self.failure_message())?
     }
 
-    fn failure_message(&self) -> String {
+    pub(super) fn failure_message(&self) -> String {
         self.failure
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

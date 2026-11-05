@@ -220,6 +220,18 @@ impl Default for InProcessCodeModeSession {
 }
 
 impl CodeModeSession for InProcessCodeModeSession {
+    fn export_state(
+        &self,
+    ) -> CodeModeSessionResultFuture<'_, codex_code_mode_protocol::CodeModeSnapshot> {
+        Box::pin(self.runtime.export_state())
+    }
+    fn import_state(
+        &self,
+        state: codex_code_mode_protocol::CodeModeSnapshot,
+    ) -> CodeModeSessionResultFuture<'_, ()> {
+        Box::pin(self.runtime.import_state(state))
+    }
+
     fn execute<'a>(
         &'a self,
         request: ExecuteRequest,

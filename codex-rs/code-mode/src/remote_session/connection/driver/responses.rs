@@ -152,6 +152,28 @@ impl ConnectionDriver {
             return false;
         };
         match pending {
+            PendingRequest::ExportState { response_tx } => {
+                let result = match result {
+                    Ok(HostResponse::SessionExported { state }) => Ok(state),
+                    Ok(_) => Err("invalid code-mode export response".to_string()),
+                    Err(error) => Err(error),
+                };
+                // Dropping a passive observation cannot retire its published source.
+                let _ = response_tx.send(result);
+            }
+            PendingRequest::ImportState {
+                session,
+                response_tx,
+            } => {
+                let result = match result {
+                    Ok(HostResponse::SessionImported) => Ok(()),
+                    Ok(_) => Err("invalid code-mode import response".to_string()),
+                    Err(error) => Err(error),
+                };
+                if response_tx.send(result).is_err() && self.sessions.contains(&session.id) {
+                    return self.shutdown_abandoned_session(session);
+                }
+            }
             PendingRequest::OpenSession {
                 session,
                 cleanup,
@@ -309,25 +331,22 @@ impl ConnectionDriver {
                 };
                 let _ = response_tx.send(Ok(result));
             }
-            PendingRequest::ShutdownSession {
-                session,
-                response_tx,
-            } => match result {
+            PendingRequest::ShutdownSession { session, cleanup } => match result {
                 Ok(HostResponse::SessionClosed { session_id }) if session_id == session.id => {
                     let effects = self.close_session_locally(&session.id);
                     if !self.apply_delegate_effects(effects) {
+                        cleanup.fail(Vec::new());
                         return false;
                     }
-                    let _ = response_tx.send(Ok(()));
+                    // Publish success only after this receiver's local cleanup.
+                    cleanup.acknowledge(session);
                 }
                 Ok(_) => {
                     let err = "code-mode host returned an invalid shutdown response".to_string();
-                    let _ = response_tx.send(Err(err.clone()));
                     self.fail(err);
                     return false;
                 }
                 Err(err) => {
-                    let _ = response_tx.send(Err(err.clone()));
                     self.fail(err);
                     return false;
                 }
@@ -392,27 +411,15 @@ impl ConnectionDriver {
     }
 
     fn shutdown_abandoned_session(&mut self, session: RemoteSession) -> bool {
-        let Some(should_shutdown) = self.sessions.begin_abandoned_shutdown(&session.id) else {
-            self.fail(format!(
-                "code-mode host committed abandoned session {} without local state",
-                session.id
-            ));
-            return false;
+        let cleanup = match self.sessions.begin_abandoned_shutdown(&session) {
+            Ok(Some(cleanup)) => cleanup,
+            Ok(None) => return true,
+            Err(error) => {
+                self.fail(error);
+                return false;
+            }
         };
-        if !should_shutdown {
-            return true;
-        }
-        let (response_tx, response_rx) = oneshot::channel();
-        drop(response_rx);
-        self.send_request(
-            HostRequest::ShutdownSession {
-                session_id: session.id.clone(),
-            },
-            PendingRequest::ShutdownSession {
-                session,
-                response_tx,
-            },
-        )
+        self.start_session_shutdown(session, cleanup)
     }
 
     fn terminate_abandoned_cell(&mut self, session: RemoteSession, cell_id: WireCellId) -> bool {

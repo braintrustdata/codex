@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use codex_code_mode_protocol::CellId;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -15,6 +16,7 @@ use crate::session_runtime::ObserveMode;
 use crate::session_runtime::OutputItem;
 use crate::session_runtime::ToolKind;
 use crate::session_runtime::ToolName;
+pub(crate) use codex_code_mode_protocol::CompletedCellSnapshot;
 
 pub(crate) type CellEventFuture =
     Pin<Box<dyn Future<Output = Result<CellEvent, CellError>> + Send + 'static>>;
@@ -65,7 +67,8 @@ pub(crate) trait CellHost: Send + Sync + 'static {
 
 #[derive(Clone)]
 pub(crate) struct CellHandle {
-    command_tx: mpsc::UnboundedSender<CellCommand>,
+    public_cell_id: Option<CellId>,
+    command_tx: Option<mpsc::UnboundedSender<CellCommand>>,
     state: Arc<CellState>,
 }
 
@@ -74,7 +77,48 @@ impl CellHandle {
         command_tx: mpsc::UnboundedSender<CellCommand>,
         state: Arc<CellState>,
     ) -> Self {
-        Self { command_tx, state }
+        Self {
+            public_cell_id: None,
+            command_tx: Some(command_tx),
+            state,
+        }
+    }
+
+    pub(crate) fn restored(snapshot: CompletedCellSnapshot, token: CancellationToken) -> Self {
+        Self {
+            public_cell_id: snapshot.public_cell_id,
+            command_tx: None,
+            state: Arc::new(CellState {
+                phase: Mutex::new(CellPhase::Completed {
+                    pending_initial_yield_items: snapshot.pending_initial_yield_items,
+                    event: snapshot.event,
+                }),
+                cancellation_token: token,
+            }),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> Option<CompletedCellSnapshot> {
+        let phase = self
+            .state
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*phase {
+            CellPhase::Completed {
+                pending_initial_yield_items,
+                event,
+            } => Some(CompletedCellSnapshot {
+                public_cell_id: self.public_cell_id.clone(),
+                pending_initial_yield_items: pending_initial_yield_items.clone(),
+                event: event.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn restored_consumed(&self) -> bool {
+        self.command_tx.is_none() && !self.state.accepting_observations()
     }
 
     pub(crate) fn observe(&self, observation: impl Into<Observation>) -> CellEventFuture {
@@ -82,10 +126,14 @@ impl CellHandle {
             return closed_event();
         }
         let (response_tx, response_rx) = oneshot::channel();
-        if self
-            .command_tx
+        let observation = observation.into();
+        let Some(command_tx) = &self.command_tx else {
+            self.state.route_observation(observation.mode, response_tx);
+            return response_event(response_rx);
+        };
+        if command_tx
             .send(CellCommand::Observe {
-                observation: observation.into(),
+                observation,
                 response_tx,
             })
             .is_err()

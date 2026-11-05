@@ -181,6 +181,13 @@ pub enum HostToClient {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "method", rename_all_fields = "camelCase")]
 pub enum HostRequest {
+    #[serde(rename = "session/export")]
+    ExportSession { session_id: SessionId },
+    #[serde(rename = "session/import")]
+    ImportSession {
+        session_id: SessionId,
+        state: crate::CodeModeSnapshot,
+    },
     #[serde(rename = "session/open")]
     OpenSession {
         session_id: SessionId,
@@ -209,6 +216,10 @@ pub enum HostRequest {
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "type", rename_all_fields = "camelCase")]
 pub enum HostResponse {
+    #[serde(rename = "session/exported")]
+    SessionExported { state: crate::CodeModeSnapshot },
+    #[serde(rename = "session/imported")]
+    SessionImported,
     #[serde(rename = "session/ready")]
     SessionReady { session_id: SessionId },
     #[serde(rename = "execution/started")]

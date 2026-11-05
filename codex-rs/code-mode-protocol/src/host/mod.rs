@@ -17,6 +17,7 @@ pub const SESSION_RESOURCE_LIMITS_CAPABILITY: &str = "session-cell-execution-res
 
 /// Support for yielding an in-flight execute or wait observation.
 pub const YIELD_OBSERVATION_CAPABILITY: &str = "yield-observation";
+pub const STATE_TRANSFER_CAPABILITY: &str = "settled-session-state-transfer-v1";
 
 pub use codec::EncodedFrame;
 pub use codec::FramedReader;

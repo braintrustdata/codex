@@ -28,6 +28,41 @@ use super::types::RemoteSession;
 impl ConnectionDriver {
     pub(super) fn handle_command(&mut self, command: DriverCommand) -> bool {
         match command {
+            DriverCommand::ExportState {
+                session,
+                response_tx,
+            } => {
+                if let Err(error) = self.sessions.require_ready(&session) {
+                    let _ = response_tx.send(Err(error));
+                    return true;
+                }
+                self.send_request(
+                    HostRequest::ExportSession {
+                        session_id: session.id,
+                    },
+                    PendingRequest::ExportState { response_tx },
+                )
+            }
+            DriverCommand::ImportState {
+                session,
+                state,
+                response_tx,
+            } => {
+                if let Err(error) = self.sessions.require_ready(&session) {
+                    let _ = response_tx.send(Err(error));
+                    return true;
+                }
+                self.send_request(
+                    HostRequest::ImportSession {
+                        session_id: session.id.clone(),
+                        state,
+                    },
+                    PendingRequest::ImportState {
+                        session,
+                        response_tx,
+                    },
+                )
+            }
             DriverCommand::OpenSession {
                 session,
                 limits,
@@ -70,8 +105,9 @@ impl ConnectionDriver {
             } => self.terminate(session, cell_id, response_tx),
             DriverCommand::ShutdownSession {
                 session,
+                cleanup,
                 response_tx,
-            } => self.shutdown_session(session, response_tx),
+            } => self.shutdown_session(session, cleanup, response_tx),
         }
     }
 
@@ -296,20 +332,36 @@ impl ConnectionDriver {
     fn shutdown_session(
         &mut self,
         session: RemoteSession,
+        cleanup: super::cleanup::SessionCleanup,
         response_tx: oneshot::Sender<Result<(), String>>,
     ) -> bool {
-        if let Err(err) = self.sessions.begin_shutdown(&session) {
-            let _ = response_tx.send(Err(err));
-            return true;
+        let start = match self.sessions.begin_shutdown(&session, &cleanup) {
+            Ok(start) => start,
+            Err(err) => {
+                let _ = response_tx.send(Err(err));
+                return true;
+            }
+        };
+        // This reply grants admission only. The caller always joins the exact
+        // receipt, including errors or an acknowledgement that already arrived.
+        let _ = response_tx.send(Ok(()));
+        if start {
+            self.start_session_shutdown(session, cleanup)
+        } else {
+            true
         }
+    }
+
+    pub(super) fn start_session_shutdown(
+        &mut self,
+        session: RemoteSession,
+        cleanup: super::cleanup::SessionCleanup,
+    ) -> bool {
         self.send_request(
             HostRequest::ShutdownSession {
                 session_id: session.id.clone(),
             },
-            PendingRequest::ShutdownSession {
-                session,
-                response_tx,
-            },
+            PendingRequest::ShutdownSession { session, cleanup },
         )
     }
 
@@ -328,9 +380,15 @@ impl ConnectionDriver {
         let frame = match EncodedFrame::encode(&message) {
             Ok(frame) => frame,
             Err(err) => {
-                pending.fail(format!(
-                    "code-mode request exceeds the IPC frame limit: {err}"
-                ));
+                let shutdown = matches!(&pending, PendingRequest::ShutdownSession { .. });
+                let reason = format!("code-mode request exceeds the IPC frame limit: {err}");
+                pending.fail(reason.clone());
+                if shutdown {
+                    // A receiver whose retirement cannot be sent must fail through
+                    // the existing joined connection cleanup, not leave waiters stuck.
+                    self.fail(reason);
+                    return false;
+                }
                 return true;
             }
         };

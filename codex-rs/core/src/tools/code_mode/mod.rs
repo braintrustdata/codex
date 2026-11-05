@@ -75,6 +75,7 @@ pub(crate) struct ExecContext {
 
 pub(crate) struct CodeModeService {
     session: OnceCell<Arc<dyn CodeModeSession>>,
+    thread_id: ThreadId,
     session_provider: Arc<dyn CodeModeSessionProvider>,
     availability: Result<(), String>,
     dispatch_broker: Arc<CodeModeDispatchBroker>,
@@ -94,6 +95,7 @@ impl CodeModeService {
         let availability = session_provider.availability();
         Self {
             session: OnceCell::new(),
+            thread_id,
             session_provider,
             availability,
             dispatch_broker,
@@ -231,6 +233,15 @@ impl CodeModeService {
         )
     }
 
+    pub(crate) async fn export_state(
+        &self,
+    ) -> Result<Option<codex_code_mode::CodeModeSnapshot>, String> {
+        match self.session.get() {
+            Some(session) => session.export_state().await.map(Some),
+            None => Ok(None),
+        }
+    }
+
     pub(crate) async fn session(&self) -> Result<Arc<dyn CodeModeSession>, String> {
         if self.shutdown_token.is_cancelled() {
             return Err("code mode session is shutting down".to_string());
@@ -247,7 +258,7 @@ impl CodeModeService {
                     }
                     session = self
                         .session_provider
-                        .create_session() => session?,
+                        .create_session_for_thread(self.thread_id) => session?,
                 };
                 if self.shutdown_token.is_cancelled() {
                     let _ = session.shutdown().await;

@@ -53,48 +53,9 @@ impl From<ObserveMode> for Observation {
     }
 }
 
-/// An observable cell lifecycle event.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum CellEvent {
-    Yielded {
-        content_items: Vec<OutputItem>,
-    },
-    Pending {
-        content_items: Vec<OutputItem>,
-        pending_tool_call_ids: Vec<String>,
-    },
-    Completed {
-        content_items: Vec<OutputItem>,
-        error_text: Option<String>,
-    },
-    Terminated {
-        content_items: Vec<OutputItem>,
-    },
-}
-
-/// Output emitted by a cell since its preceding observation.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum OutputItem {
-    Text {
-        text: String,
-    },
-    Image {
-        image_url: String,
-        detail: Option<ImageDetail>,
-    },
-    Audio {
-        audio_url: String,
-    },
-}
-
-/// Requested image fidelity for an output image.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ImageDetail {
-    Auto,
-    Low,
-    High,
-    Original,
-}
+pub(crate) use codex_code_mode_protocol::SnapshotCellEvent as CellEvent;
+pub(crate) use codex_code_mode_protocol::SnapshotImageDetail as ImageDetail;
+pub(crate) use codex_code_mode_protocol::SnapshotOutputItem as OutputItem;
 
 /// Transport-neutral input for creating a cell.
 ///

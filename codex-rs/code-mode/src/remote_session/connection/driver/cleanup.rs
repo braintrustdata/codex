@@ -1,4 +1,6 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use super::types::RemoteSession;
 
 use tokio_util::sync::CancellationToken;
 
@@ -7,6 +9,7 @@ use super::session_registry::CellOwner;
 
 struct CleanupInner {
     complete: CancellationToken,
+    acknowledged: Mutex<Option<RemoteSession>>,
 }
 
 #[derive(Clone)]
@@ -19,8 +22,31 @@ impl SessionCleanup {
         Self {
             inner: Arc::new(CleanupInner {
                 complete: CancellationToken::new(),
+                acknowledged: Mutex::new(None),
             }),
         }
+    }
+
+    pub(super) fn same_receipt(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub(in crate::remote_session) fn acknowledged_for(&self, session: &RemoteSession) -> bool {
+        self.inner
+            .acknowledged
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            == Some(session)
+    }
+
+    pub(super) fn acknowledge(&self, session: RemoteSession) {
+        *self
+            .inner
+            .acknowledged
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session);
+        self.inner.complete.cancel();
     }
 
     pub(super) fn fail(&self, cells: Vec<CellOwner>) {

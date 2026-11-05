@@ -74,6 +74,66 @@ impl SessionRuntime {
         }
     }
 
+    pub(crate) async fn export_state(
+        &self,
+    ) -> Result<codex_code_mode_protocol::CodeModeSnapshot, String> {
+        let cells = self.inner.cells.lock().await;
+        if self.inner.shutdown_token.is_cancelled() {
+            return Err("code-mode session is shutting down".to_string());
+        }
+        let stored_values = self.inner.stored_values.lock().await;
+        let mut completed_cells = HashMap::new();
+        for (id, cell) in cells.iter() {
+            let snapshot = cell
+                .snapshot()
+                .ok_or("code-mode session has active cells")?;
+            completed_cells.insert(id.as_str().to_owned(), snapshot);
+        }
+        Ok(codex_code_mode_protocol::CodeModeSnapshot {
+            format_version: 1,
+            next_cell_id: self.inner.next_cell_id.load(Ordering::Relaxed),
+            stored_values: stored_values
+                .iter()
+                .map(|(key, value)| (key.clone(), value.as_ref().clone()))
+                .collect(),
+            completed_cells,
+        })
+    }
+
+    pub(crate) async fn import_state(
+        &self,
+        snapshot: codex_code_mode_protocol::CodeModeSnapshot,
+    ) -> Result<(), String> {
+        snapshot.validate()?;
+        let mut restored = HashMap::new();
+        for (id, cell) in snapshot.completed_cells {
+            restored.insert(
+                CellId::new(id),
+                CellHandle::restored(cell, self.inner.shutdown_token.child_token()),
+            );
+        }
+        let mut cells = self.inner.cells.lock().await;
+        let mut stored_values = self.inner.stored_values.lock().await;
+        if self.inner.shutdown_token.is_cancelled()
+            || !cells.is_empty()
+            || !stored_values.is_empty()
+            || self.inner.next_cell_id.load(Ordering::Relaxed) != 1
+            || !self.inner.cell_tasks.is_empty()
+        {
+            return Err("code-mode import requires a fresh session".to_string());
+        }
+        *stored_values = snapshot
+            .stored_values
+            .into_iter()
+            .map(|(key, value)| (key, Arc::new(value)))
+            .collect();
+        *cells = restored;
+        self.inner
+            .next_cell_id
+            .store(snapshot.next_cell_id, Ordering::Relaxed);
+        Ok(())
+    }
+
     pub(crate) async fn execute<D: SessionRuntimeDelegate>(
         &self,
         request: CreateCellRequest,
@@ -83,14 +143,8 @@ impl SessionRuntime {
         if self.inner.shutdown_token.is_cancelled() {
             return Err(Error::ShuttingDown);
         }
-        let cell_id = self.allocate_cell_id()?;
-        let initial_event = self
-            .start_cell(
-                cell_id.clone(),
-                request,
-                initial_observation.into(),
-                delegate,
-            )
+        let (cell_id, initial_event) = self
+            .start_cell(request, initial_observation.into(), delegate)
             .await?;
         Ok(StartedCell {
             cell_id,
@@ -111,16 +165,17 @@ impl SessionRuntime {
         cell_id: &CellId,
         observation: impl Into<Observation> + Send,
     ) -> Result<PendingEvent, Error> {
-        let handle = self
-            .inner
-            .cells
-            .lock()
-            .await
+        let mut cells = self.inner.cells.lock().await;
+        let handle = cells
             .get(cell_id)
             .cloned()
             .ok_or_else(|| Error::MissingCell(cell_id.clone()))?;
+        let event = handle.observe(observation);
+        if handle.restored_consumed() {
+            cells.remove(cell_id);
+        }
         Ok(PendingEvent {
-            event: map_actor_event(cell_id.clone(), handle.observe(observation)),
+            event: map_actor_event(cell_id.clone(), event),
         })
     }
 
@@ -133,10 +188,14 @@ impl SessionRuntime {
             .get(cell_id)
             .cloned()
             .ok_or_else(|| Error::MissingCell(cell_id.clone()))?;
-        handle
+        let result = handle
             .terminate()
             .await
-            .map_err(|error| actor_error(cell_id, error))
+            .map_err(|error| actor_error(cell_id, error));
+        if handle.restored_consumed() {
+            self.inner.cells.lock().await.remove(cell_id);
+        }
+        result
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), Error> {
@@ -162,11 +221,15 @@ impl SessionRuntime {
 
     async fn start_cell<D: SessionRuntimeDelegate>(
         &self,
-        cell_id: CellId,
         request: CreateCellRequest,
         initial_observation: Observation,
         delegate: Arc<D>,
-    ) -> Result<RuntimeEventFuture, Error> {
+    ) -> Result<(CellId, RuntimeEventFuture), Error> {
+        let mut cells = self.inner.cells.lock().await;
+        if self.inner.shutdown_token.is_cancelled() {
+            return Err(Error::ShuttingDown);
+        }
+        let cell_id = self.allocate_cell_id()?;
         let stored_values = self.inner.stored_values.lock().await.clone();
         let host = Arc::new(RuntimeCellHost {
             delegate,
@@ -174,10 +237,6 @@ impl SessionRuntime {
             inner: Arc::clone(&self.inner),
             execution_context: opentelemetry::Context::current(),
         });
-        let mut cells = self.inner.cells.lock().await;
-        if self.inner.shutdown_token.is_cancelled() {
-            return Err(Error::ShuttingDown);
-        }
         if cells.contains_key(&cell_id) {
             return Err(Error::DuplicateCell(cell_id));
         }
@@ -204,7 +263,7 @@ impl SessionRuntime {
             });
         }
         drop(cells);
-        Ok(map_actor_event(cell_id, initial_event))
+        Ok((cell_id.clone(), map_actor_event(cell_id, initial_event)))
     }
 
     fn begin_shutdown(&self) {
