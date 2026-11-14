@@ -19,7 +19,7 @@ pub(super) use codex_code_mode_protocol::host::BOUNDED_OUTPUT_MAX_IMAGE_BYTES as
 pub(crate) const MAX_OUTPUT_ITEMS: usize = 32 * 1024;
 const TEXT_BLOCK_BYTES: usize = 4096;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(test, derive(PartialEq))]
 enum RetainedItem {
     Content(OutputItem),
@@ -29,7 +29,7 @@ enum RetainedItem {
 
 /// Store a partially evicted suffix in blocks so later writes can release
 /// its oldest bytes without copying the rest. Only the first block has an offset.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(test, derive(PartialEq))]
 struct PartialText {
     blocks: VecDeque<String>,
@@ -154,21 +154,21 @@ impl RetainedItem {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(test, derive(PartialEq))]
 struct OpenOutput {
     items: VecDeque<RetainedItem>,
     content_bytes: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub(crate) struct BoundedOutput {
     state: Retention,
     media: MediaBytes,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(test, derive(PartialEq))]
 struct MediaBytes {
     images: usize,
@@ -206,7 +206,7 @@ impl MediaBytes {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(test, derive(PartialEq))]
 enum Retention {
     /// All individually fitting items are intact, in source order.
@@ -224,7 +224,7 @@ impl Default for BoundedOutput {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(test, derive(PartialEq))]
 struct HeadTailOutput {
     head: Vec<RetainedItem>,
@@ -511,6 +511,43 @@ impl BoundedOutput {
             item.move_into(&mut output);
         }
         output
+    }
+
+    pub(crate) fn validate_snapshot(&self) -> Result<(), &'static str> {
+        fn validate<'a>(items: impl Iterator<Item = &'a RetainedItem>) -> Result<(), &'static str> {
+            let mut previous_text = false;
+            for item in items {
+                match item {
+                    RetainedItem::Content(OutputItem::InputText { .. }) => previous_text = true,
+                    RetainedItem::Content(_) => previous_text = false,
+                    RetainedItem::Gap(_) => {}
+                    RetainedItem::Partial(text) => {
+                        let bytes = text
+                            .blocks
+                            .iter()
+                            .try_fold(0usize, |total, block| total.checked_add(block.len()))
+                            .and_then(|bytes| bytes.checked_sub(text.front_offset));
+                        if bytes != Some(text.bytes)
+                            || text.bytes > MAX_OUTPUT_BYTES
+                            || text
+                                .blocks
+                                .front()
+                                .is_some_and(|block| !block.is_char_boundary(text.front_offset))
+                            || (text.blocks.is_empty() && text.front_offset != 0)
+                            || (text.continues_prefix && !previous_text)
+                        {
+                            return Err("invalid saved code-mode output");
+                        }
+                        previous_text = true;
+                    }
+                }
+            }
+            Ok(())
+        }
+        match &self.state {
+            Retention::Open(open) => validate(open.items.iter()),
+            Retention::HeadTail(split) => validate(split.head.iter().chain(split.tail.iter())),
+        }
     }
 
     pub(crate) fn into_collected_output(self) -> CollectedOutput {

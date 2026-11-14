@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -7,6 +8,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::CodeModeOutputTruncation;
 use codex_code_mode_protocol::CodeModeSession;
 use codex_code_mode_protocol::CodeModeSessionCellExecutionLimits;
@@ -200,14 +202,19 @@ impl OwnedCodeModeHost {
             .cloned()
     }
 
-    fn allocate_session(&self) -> RemoteSession {
+    fn allocate_session(&self) -> Result<RemoteSession, String> {
         // The shared ordinal also keeps cell IDs distinct after a thread reload.
-        let generation = self.next_session_id.fetch_add(1, Ordering::Relaxed);
+        let generation = self
+            .next_session_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
+                generation.checked_add(1)
+            })
+            .map_err(|_| "code-mode host generation space exhausted".to_string())?;
         let id = match SessionId::new(format!("session-{generation}")) {
             Ok(session_id) => session_id,
             Err(_) => unreachable!("a generated code-mode session ID is nonempty"),
         };
-        RemoteSession { id, generation }
+        Ok(RemoteSession { id, generation })
     }
 }
 
@@ -227,9 +234,48 @@ struct SessionBinding {
     connection: Arc<Connection>,
     remote: RemoteSession,
     cleanup: SessionCleanup,
+    retained_cell_ids: Arc<StdMutex<HashMap<String, CellId>>>,
+}
+
+impl SessionBinding {
+    fn request_cell_id(&self, public: &CellId) -> Result<CellId, String> {
+        let ids = self
+            .retained_cell_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let wire = public
+            .as_str()
+            .rsplit(':')
+            .next()
+            .unwrap_or(public.as_str());
+        if let Some(expected) = ids.get(wire) {
+            if expected != public {
+                return Err(format!(
+                    "cell {public} belongs to a stale code-mode host generation"
+                ));
+            }
+            return Ok(self.remote.public_cell_id(&CellId::new(wire.to_owned())));
+        }
+        Ok(public.clone())
+    }
+}
+
+fn retained_wait_identity(mut outcome: WaitOutcome, public: CellId) -> WaitOutcome {
+    let response = match &mut outcome {
+        WaitOutcome::LiveCell(response) | WaitOutcome::MissingCell(response) => response,
+    };
+    match response {
+        codex_code_mode_protocol::RuntimeResponse::Yielded { cell_id, .. }
+        | codex_code_mode_protocol::RuntimeResponse::Result { cell_id, .. }
+        | codex_code_mode_protocol::RuntimeResponse::Terminated { cell_id, .. } => {
+            *cell_id = public
+        }
+    }
+    outcome
 }
 
 struct SessionInner {
+    open_attempted: AtomicBool,
     host: Arc<OwnedCodeModeHost>,
     options: CodeModeSessionOptions,
     // The first successful open fixes the output policy for all generations of this session.
@@ -258,6 +304,7 @@ impl ProcessOwnedCodeModeSession {
     fn with_host(host: Arc<OwnedCodeModeHost>, options: CodeModeSessionOptions) -> Self {
         Self {
             inner: Arc::new(SessionInner {
+                open_attempted: AtomicBool::new(false),
                 host,
                 options,
                 output_truncation: OnceLock::new(),
@@ -305,16 +352,25 @@ impl ProcessOwnedCodeModeSession {
     ) -> Result<WaitOutcome, String> {
         let binding = self.connection().await?;
         request.max_output_tokens = self.server_output_budget(request.max_output_tokens);
-        binding
+        let public = request.cell_id.clone();
+        request.cell_id = binding.request_cell_id(&public)?;
+        let outcome = binding
             .connection
             .wait(binding.remote, request, preempt)
-            .await
+            .await?;
+        Ok(retained_wait_identity(outcome, public))
     }
 
     pub async fn terminate(&self, mut request: TerminateRequest) -> Result<WaitOutcome, String> {
         let binding = self.connection().await?;
+        let public = request.cell_id.clone();
         request.max_output_tokens = self.server_output_budget(request.max_output_tokens);
-        binding.connection.terminate(binding.remote, request).await
+        request.cell_id = binding.request_cell_id(&public)?;
+        let outcome = binding
+            .connection
+            .terminate(binding.remote, request)
+            .await?;
+        Ok(retained_wait_identity(outcome, public))
     }
 
     pub async fn shutdown(&self) -> Result<(), String> {
@@ -323,6 +379,37 @@ impl ProcessOwnedCodeModeSession {
 }
 
 impl SessionInner {
+    async fn export_binding(&self) -> Result<Option<SessionBinding>, String> {
+        if self.shutdown_requested.load(Ordering::Acquire) {
+            return Err("code mode session is shutting down".to_string());
+        }
+        let opening = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &*state {
+                SessionState::New if !self.open_attempted.load(Ordering::Acquire) => {
+                    return Ok(None);
+                }
+                SessionState::New => {
+                    return Err("code-mode export has no retained source session".to_string());
+                }
+                SessionState::Open(binding) => {
+                    if !binding.connection.is_alive() {
+                        return Err(binding.connection.failure_message());
+                    }
+                    return Ok(Some(binding.clone()));
+                }
+                SessionState::Opening { result_rx, .. } => result_rx.clone(),
+                SessionState::Closing | SessionState::Closed => {
+                    return Err("code mode session is shutting down".to_string());
+                }
+            }
+        };
+        wait_for_watch(opening).await.map(Some)
+    }
+
     async fn connection(self: &Arc<Self>) -> Result<SessionBinding, String> {
         loop {
             if self.shutdown_requested.load(Ordering::Acquire) {
@@ -335,7 +422,8 @@ impl SessionInner {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 match &*state {
                     SessionState::New => {
-                        let remote = self.host.allocate_session();
+                        let remote = self.host.allocate_session()?;
+                        self.open_attempted.store(true, Ordering::Release);
                         let (result_tx, result_rx) = watch::channel(None);
                         *state = SessionState::Opening {
                             remote: remote.clone(),
@@ -385,6 +473,7 @@ impl SessionInner {
                     connection,
                     remote: remote.clone(),
                     cleanup,
+                    retained_cell_ids: Arc::new(StdMutex::new(HashMap::new())),
                 })
             }
             Err(err) => Err(err.to_string()),
@@ -444,11 +533,6 @@ impl SessionInner {
                     SessionState::Opening { result_rx, .. } => {
                         ShutdownAction::WaitForOpen(result_rx.clone())
                     }
-                    SessionState::Open(binding) if !binding.connection.is_alive() => {
-                        let cleanup = binding.cleanup.clone();
-                        *state = SessionState::Closing;
-                        ShutdownAction::WaitForSessionCleanup(cleanup)
-                    }
                     SessionState::Open(binding) => {
                         let binding = binding.clone();
                         *state = SessionState::Closing;
@@ -468,20 +552,11 @@ impl SessionInner {
                     self.wait_for_retired_cleanups().await;
                     return Ok(());
                 }
-                ShutdownAction::WaitForSessionCleanup(cleanup) => {
-                    cleanup.wait().await;
-                    self.wait_for_retired_cleanups().await;
-                    *self
-                        .state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = SessionState::Closed;
-                    return Ok(());
-                }
                 ShutdownAction::Close(binding) => {
-                    let result = binding.connection.shutdown_session(binding.remote).await;
-                    if result.is_err() && !binding.connection.is_alive() {
-                        binding.cleanup.wait().await;
-                    }
+                    let result = binding
+                        .connection
+                        .shutdown_session(binding.remote, binding.cleanup.clone())
+                        .await;
                     self.wait_for_retired_cleanups().await;
                     *self
                         .state
@@ -520,7 +595,6 @@ impl SessionInner {
 enum ShutdownAction {
     WaitForOpen(watch::Receiver<Option<Result<SessionBinding, String>>>),
     Finish,
-    WaitForSessionCleanup(SessionCleanup),
     Close(SessionBinding),
 }
 
@@ -562,6 +636,75 @@ impl CodeModeSession for ProcessOwnedCodeModeSession {
             .get()
             .copied()
             .unwrap_or_default()
+    }
+
+    fn export_state(
+        &self,
+    ) -> CodeModeSessionResultFuture<'_, codex_code_mode_protocol::CodeModeSnapshot> {
+        Box::pin(async move {
+            let Some(binding) = self.inner.export_binding().await? else {
+                return Ok(codex_code_mode_protocol::CodeModeSnapshot {
+                    format_version: 1,
+                    next_cell_id: 1,
+                    stored_values: HashMap::new(),
+                    completed_cells: HashMap::new(),
+                });
+            };
+            let mut state = binding
+                .connection
+                .export_state(binding.remote.clone())
+                .await?;
+            for (wire, cell) in &mut state.completed_cells {
+                if cell.public_cell_id.is_none() {
+                    cell.public_cell_id =
+                        Some(binding.remote.public_cell_id(&CellId::new(wire.clone())));
+                }
+            }
+            state.validate()?;
+            Ok(state)
+        })
+    }
+    fn import_state(
+        &self,
+        mut state: codex_code_mode_protocol::CodeModeSnapshot,
+    ) -> CodeModeSessionResultFuture<'_, ()> {
+        Box::pin(async move {
+            state.validate()?;
+            let mut ids = HashMap::new();
+            let mut retained_generation = 1;
+            for (wire, cell) in &mut state.completed_cells {
+                let public = cell
+                    .public_cell_id
+                    .get_or_insert_with(|| CellId::new(wire.clone()));
+                let generation = public
+                    .as_str()
+                    .strip_prefix('g')
+                    .and_then(|value| value.split_once(':'))
+                    .and_then(|(generation, _)| generation.parse::<u64>().ok())
+                    .unwrap_or(1);
+                retained_generation = retained_generation.max(generation);
+                ids.insert(wire.clone(), public.clone());
+            }
+            let binding = self.connection().await?;
+            // A later binding must never reuse an imported public generation for
+            // unrelated cells. Reserve the existing monotonic allocator before
+            // import can publish identities; MAX makes future allocation fail closed.
+            self.inner.host.next_session_id.fetch_max(
+                retained_generation
+                    .max(binding.remote.generation)
+                    .saturating_add(1),
+                Ordering::Relaxed,
+            );
+            binding
+                .connection
+                .import_state(binding.remote, state)
+                .await?;
+            *binding
+                .retained_cell_ids
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = ids;
+            Ok(())
+        })
     }
 
     fn execute<'a>(

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
 use codex_code_mode_protocol::CodeModeSessionOptions;
 use codex_code_mode_protocol::ExecuteRequest;
@@ -28,7 +29,22 @@ pub(in crate::remote_session) struct RemoteSession {
     pub(in crate::remote_session) generation: u64,
 }
 
+impl RemoteSession {
+    pub(in crate::remote_session) fn public_cell_id(&self, cell_id: &CellId) -> CellId {
+        super::cell_ids::public_cell_id_from_protocol(self.generation, cell_id)
+    }
+}
+
 pub(in crate::remote_session::connection) enum DriverCommand {
+    ExportState {
+        session: RemoteSession,
+        response_tx: oneshot::Sender<Result<codex_code_mode_protocol::CodeModeSnapshot, String>>,
+    },
+    ImportState {
+        session: RemoteSession,
+        state: codex_code_mode_protocol::CodeModeSnapshot,
+        response_tx: oneshot::Sender<Result<(), String>>,
+    },
     OpenSession {
         session: RemoteSession,
         options: CodeModeSessionOptions,
@@ -58,6 +74,7 @@ pub(in crate::remote_session::connection) enum DriverCommand {
     },
     ShutdownSession {
         session: RemoteSession,
+        cleanup: SessionCleanup,
         response_tx: oneshot::Sender<Result<(), String>>,
     },
 }
@@ -164,6 +181,15 @@ pub(super) struct UnclaimedExecute {
 }
 
 pub(super) enum PendingRequest {
+    // Export borrows published state. It never owns a session to retire.
+    ExportState {
+        response_tx: oneshot::Sender<Result<codex_code_mode_protocol::CodeModeSnapshot, String>>,
+    },
+    // Import owns an unpublished receiver until its caller accepts completion.
+    ImportState {
+        session: RemoteSession,
+        response_tx: oneshot::Sender<Result<(), String>>,
+    },
     OpenSession {
         session: RemoteSession,
         cleanup: SessionCleanup,
@@ -193,7 +219,7 @@ pub(super) enum PendingRequest {
     },
     ShutdownSession {
         session: RemoteSession,
-        response_tx: oneshot::Sender<Result<(), String>>,
+        cleanup: SessionCleanup,
     },
 }
 
@@ -212,7 +238,10 @@ impl PendingRequest {
             Self::OpenSession { cancellation, .. }
             | Self::Execute { cancellation, .. }
             | Self::Wait { cancellation, .. } => Some(cancellation),
-            Self::Terminate { .. } | Self::ShutdownSession { .. } => None,
+            Self::Terminate { .. }
+            | Self::ShutdownSession { .. }
+            | Self::ExportState { .. }
+            | Self::ImportState { .. } => None,
         }
     }
 
@@ -230,7 +259,11 @@ impl PendingRequest {
 
     pub(super) fn fail(self, reason: String) {
         match self {
-            Self::OpenSession { response_tx, .. } | Self::ShutdownSession { response_tx, .. } => {
+            Self::ExportState { response_tx } => {
+                let _ = response_tx.send(Err(reason));
+            }
+            Self::ShutdownSession { .. } => {}
+            Self::OpenSession { response_tx, .. } | Self::ImportState { response_tx, .. } => {
                 let _ = response_tx.send(Err(reason));
             }
             Self::Execute { response_tx, .. } => {

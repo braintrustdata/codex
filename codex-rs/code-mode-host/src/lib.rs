@@ -284,6 +284,7 @@ async fn negotiate<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             SESSION_RESOURCE_LIMITS_CAPABILITY,
             YIELD_OBSERVATION_CAPABILITY,
             BOUNDED_OUTPUT_CAPABILITY,
+            codex_code_mode_protocol::host::STATE_TRANSFER_CAPABILITY,
         ]
         .into_iter()
         .map(Capability::new)
@@ -422,6 +423,29 @@ impl HostState {
                     )
                 })
                 .map(|()| HostResponse::SessionReady { session_id });
+                self.respond(request_id, result);
+            }
+            HostRequest::ExportSession { session_id } => {
+                let result = match self.session(&session_id) {
+                    Ok(session) => {
+                        codex_code_mode_protocol::CodeModeSession::export_state(session.as_ref())
+                            .await
+                            .map(|state| HostResponse::SessionExported { state })
+                    }
+                    Err(error) => Err(error),
+                };
+                self.respond(request_id, result);
+            }
+            HostRequest::ImportSession { session_id, state } => {
+                let result = match self.session(&session_id) {
+                    Ok(session) => codex_code_mode_protocol::CodeModeSession::import_state(
+                        session.as_ref(),
+                        state,
+                    )
+                    .await
+                    .map(|()| HostResponse::SessionImported),
+                    Err(error) => Err(error),
+                };
                 self.respond(request_id, result);
             }
             HostRequest::Execute {
@@ -650,6 +674,8 @@ impl HostState {
 
 #[derive(Clone, Copy)]
 enum RequestKind {
+    ExportSession,
+    ImportSession,
     OpenSession,
     Execute,
     Wait,
@@ -660,6 +686,8 @@ enum RequestKind {
 impl RequestKind {
     fn from(request: &HostRequest) -> Self {
         match request {
+            HostRequest::ExportSession { .. } => Self::ExportSession,
+            HostRequest::ImportSession { .. } => Self::ImportSession,
             HostRequest::OpenSession { .. } => Self::OpenSession,
             HostRequest::Execute { .. } => Self::Execute,
             HostRequest::Wait { .. } => Self::Wait,
@@ -674,6 +702,8 @@ impl RequestKind {
 
     fn as_str(self) -> &'static str {
         match self {
+            Self::ExportSession => "export_session",
+            Self::ImportSession => "import_session",
             Self::OpenSession => "open_session",
             Self::Execute => "execute",
             Self::Wait => "wait",
