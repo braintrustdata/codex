@@ -251,6 +251,21 @@ impl CodexThread {
         self.session.services.local_agent_runtime.tree_id()
     }
 
+    pub async fn export_code_mode_state(
+        &self,
+    ) -> Result<Option<codex_code_mode::CodeModeSnapshot>, String> {
+        self.session.services.code_mode_service.export_state().await
+    }
+
+    pub async fn prepare_code_mode_state(&self) -> Result<(), String> {
+        self.session
+            .services
+            .code_mode_service
+            .session()
+            .await
+            .map(|_| ())
+    }
+
     pub async fn submit(&self, op: Op) -> CodexResult<String> {
         self.submit_with_trace(op, /*trace*/ None).await
     }

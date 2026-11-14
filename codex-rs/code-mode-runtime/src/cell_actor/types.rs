@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::time::Instant;
 
+use codex_code_mode_protocol::CellId;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -15,6 +16,7 @@ use crate::session_runtime::CellEvent;
 use crate::session_runtime::Observation;
 use crate::session_runtime::ToolKind;
 use crate::session_runtime::ToolName;
+pub(crate) use codex_code_mode_protocol::CompletedCellSnapshot;
 
 pub(crate) type CellEventFuture =
     Pin<Box<dyn Future<Output = Result<CellEvent, CellError>> + Send + 'static>>;
@@ -64,7 +66,8 @@ pub(crate) trait CellHost: Send + Sync + 'static {
 
 #[derive(Clone)]
 pub(crate) struct CellHandle {
-    command_tx: mpsc::UnboundedSender<CellCommand>,
+    public_cell_id: Option<CellId>,
+    command_tx: Option<mpsc::UnboundedSender<CellCommand>>,
     state: Arc<CellState>,
 }
 
@@ -73,7 +76,80 @@ impl CellHandle {
         command_tx: mpsc::UnboundedSender<CellCommand>,
         state: Arc<CellState>,
     ) -> Self {
-        Self { command_tx, state }
+        Self {
+            public_cell_id: None,
+            command_tx: Some(command_tx),
+            state,
+        }
+    }
+
+    pub(crate) fn restored(
+        snapshot: CompletedCellSnapshot,
+        token: CancellationToken,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            public_cell_id: snapshot.public_cell_id,
+            command_tx: None,
+            state: Arc::new(CellState {
+                phase: Mutex::new(CellPhase::Completed {
+                    event: restored_event(
+                        snapshot.event,
+                        snapshot.pending_initial_yield_items,
+                        snapshot.output_collector,
+                    )?,
+                    completed_at: Instant::now(),
+                }),
+                cancellation_token: token,
+            }),
+        })
+    }
+
+    pub(crate) fn snapshot(&self) -> Result<Option<CompletedCellSnapshot>, String> {
+        let phase = self
+            .state
+            .phase
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let CellPhase::Completed { event, .. } = &*phase else {
+            return Ok(None);
+        };
+        let (content_items, error_text) = match event {
+            CellEvent::Completed {
+                content_items,
+                error_text,
+                ..
+            } => (content_items, Some(error_text)),
+            CellEvent::Terminated { content_items } => (content_items, None),
+            _ => return Err("saved code-mode cell is not terminal".to_string()),
+        };
+        let (items, output_collector) = match content_items {
+            crate::output::OutputCollector::Client(items) => {
+                (items.iter().cloned().map(snapshot_item).collect(), None)
+            }
+            output => (
+                Vec::new(),
+                Some(serde_json::to_value(output).map_err(|e| e.to_string())?),
+            ),
+        };
+        let event = match error_text {
+            Some(error_text) => codex_code_mode_protocol::SnapshotCellEvent::Completed {
+                content_items: items,
+                error_text: error_text.clone(),
+            },
+            None => codex_code_mode_protocol::SnapshotCellEvent::Terminated {
+                content_items: items,
+            },
+        };
+        Ok(Some(CompletedCellSnapshot {
+            public_cell_id: self.public_cell_id.clone(),
+            pending_initial_yield_items: None,
+            event,
+            output_collector,
+        }))
+    }
+
+    pub(crate) fn restored_consumed(&self) -> bool {
+        self.command_tx.is_none() && !self.state.accepting_observations()
     }
 
     pub(crate) fn observe(&self, observation: impl Into<Observation>) -> CellEventFuture {
@@ -81,10 +157,14 @@ impl CellHandle {
             return closed_event();
         }
         let (response_tx, response_rx) = oneshot::channel();
-        if self
-            .command_tx
+        let observation = observation.into();
+        let Some(command_tx) = &self.command_tx else {
+            self.state.route_observation(response_tx);
+            return response_event(response_rx);
+        };
+        if command_tx
             .send(CellCommand::Observe {
-                observation: observation.into(),
+                observation,
                 response_tx,
             })
             .is_err()
@@ -373,4 +453,107 @@ fn ready_event(event: CellEvent) -> CellEventFuture {
 
 fn closed_event() -> CellEventFuture {
     Box::pin(async { Err(CellError::Closed) })
+}
+
+fn snapshot_item(
+    item: codex_code_mode_protocol::FunctionCallOutputContentItem,
+) -> codex_code_mode_protocol::SnapshotOutputItem {
+    use codex_code_mode_protocol::{
+        FunctionCallOutputContentItem as Item, SnapshotOutputItem as Saved,
+    };
+    match item {
+        Item::InputText { text } => Saved::Text { text },
+        Item::InputImage { image_url, detail } => Saved::Image {
+            image_url,
+            detail: detail.map(|detail| match detail {
+                codex_code_mode_protocol::ImageDetail::Auto => {
+                    codex_code_mode_protocol::SnapshotImageDetail::Auto
+                }
+                codex_code_mode_protocol::ImageDetail::Low => {
+                    codex_code_mode_protocol::SnapshotImageDetail::Low
+                }
+                codex_code_mode_protocol::ImageDetail::High => {
+                    codex_code_mode_protocol::SnapshotImageDetail::High
+                }
+                codex_code_mode_protocol::ImageDetail::Original => {
+                    codex_code_mode_protocol::SnapshotImageDetail::Original
+                }
+            }),
+        },
+        Item::InputAudio { audio_url } => Saved::Audio { audio_url },
+    }
+}
+
+fn restored_item(
+    item: codex_code_mode_protocol::SnapshotOutputItem,
+) -> codex_code_mode_protocol::FunctionCallOutputContentItem {
+    use codex_code_mode_protocol::{
+        FunctionCallOutputContentItem as Item, SnapshotOutputItem as Saved,
+    };
+    match item {
+        Saved::Text { text } => Item::InputText { text },
+        Saved::Image { image_url, detail } => Item::InputImage {
+            image_url,
+            detail: detail.map(|detail| match detail {
+                codex_code_mode_protocol::SnapshotImageDetail::Auto => {
+                    codex_code_mode_protocol::ImageDetail::Auto
+                }
+                codex_code_mode_protocol::SnapshotImageDetail::Low => {
+                    codex_code_mode_protocol::ImageDetail::Low
+                }
+                codex_code_mode_protocol::SnapshotImageDetail::High => {
+                    codex_code_mode_protocol::ImageDetail::High
+                }
+                codex_code_mode_protocol::SnapshotImageDetail::Original => {
+                    codex_code_mode_protocol::ImageDetail::Original
+                }
+            }),
+        },
+        Saved::Audio { audio_url } => Item::InputAudio { audio_url },
+    }
+}
+
+fn restored_event(
+    event: codex_code_mode_protocol::SnapshotCellEvent,
+    pending: Option<Vec<codex_code_mode_protocol::SnapshotOutputItem>>,
+    output_collector: Option<JsonValue>,
+) -> Result<CellEvent, String> {
+    use codex_code_mode_protocol::SnapshotCellEvent as Saved;
+    let (items, error_text) = match event {
+        Saved::Completed {
+            content_items,
+            error_text,
+        } => (content_items, Some(error_text)),
+        Saved::Terminated { content_items } => (content_items, None),
+        _ => return Err("saved code-mode cell is not terminal".to_string()),
+    };
+    let content_items = match output_collector {
+        Some(output) => {
+            if pending.is_some() || !items.is_empty() {
+                return Err("conflicting saved code-mode output".to_string());
+            }
+            let output: crate::output::OutputCollector =
+                serde_json::from_value(output).map_err(|e| e.to_string())?;
+            if let crate::output::OutputCollector::Server(Some(bounded)) = &output {
+                bounded.validate_snapshot()?;
+            }
+            output
+        }
+        None => crate::output::OutputCollector::Client(
+            pending
+                .into_iter()
+                .flatten()
+                .chain(items)
+                .map(restored_item)
+                .collect(),
+        ),
+    };
+    Ok(match error_text {
+        Some(error_text) => CellEvent::Completed {
+            content_items,
+            error_text,
+            result_buffered_for: std::time::Duration::ZERO,
+        },
+        None => CellEvent::Terminated { content_items },
+    })
 }

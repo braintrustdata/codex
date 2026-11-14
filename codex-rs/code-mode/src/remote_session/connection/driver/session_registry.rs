@@ -92,7 +92,31 @@ impl SessionRegistry {
         Ok(())
     }
 
-    pub(super) fn begin_shutdown(&mut self, session: &RemoteSession) -> Result<(), String> {
+    pub(super) fn begin_shutdown(
+        &mut self,
+        session: &RemoteSession,
+        cleanup: &SessionCleanup,
+    ) -> Result<bool, String> {
+        let Some(record) = self.records.get_mut(&session.id) else {
+            if cleanup.acknowledged_for(session) {
+                return Ok(false);
+            }
+            return Err(format!("unknown code-mode session {}", session.id));
+        };
+        if record.remote != *session || !record.cleanup.same_receipt(cleanup) {
+            return Err("stale code-mode session generation or cleanup receipt".to_string());
+        }
+        if record.phase == SessionPhase::Closing {
+            return Ok(false);
+        }
+        record.phase = SessionPhase::Closing;
+        Ok(true)
+    }
+
+    pub(super) fn begin_abandoned_shutdown(
+        &mut self,
+        session: &RemoteSession,
+    ) -> Result<Option<SessionCleanup>, String> {
         let record = self
             .records
             .get_mut(&session.id)
@@ -101,19 +125,10 @@ impl SessionRegistry {
             return Err("stale code-mode session generation".to_string());
         }
         if record.phase == SessionPhase::Closing {
-            return Err("code-mode session is already closing".to_string());
+            return Ok(None);
         }
         record.phase = SessionPhase::Closing;
-        Ok(())
-    }
-
-    pub(super) fn begin_abandoned_shutdown(&mut self, session_id: &SessionId) -> Option<bool> {
-        let record = self.records.get_mut(session_id)?;
-        if record.phase == SessionPhase::Closing {
-            return Some(false);
-        }
-        record.phase = SessionPhase::Closing;
-        Some(true)
+        Ok(Some(record.cleanup.clone()))
     }
 
     pub(super) fn is_closing(&self, session_id: &SessionId) -> Option<bool> {

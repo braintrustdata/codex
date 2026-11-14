@@ -764,3 +764,78 @@ fn a_failed_yield_restores_image_allocation_and_omission_order() {
         OutputCollector::new(CodeModeOutputTruncation::Server)
     );
 }
+
+#[tokio::test]
+async fn snapshot_preserves_bounded_terminal_output_and_omissions() {
+    let mut output = OutputCollector::new(CodeModeOutputTruncation::Server);
+    output.push(OutputItem::InputText {
+        text: "prefix".repeat(400_000),
+    });
+    output.push(OutputItem::InputText {
+        text: "suffix".repeat(400_000),
+    });
+    let expected = crate::output::render_output(output.clone().into_collected_output(), Some(128));
+    let state = Arc::new(CellState::new(CancellationToken::new()));
+    assert_eq!(
+        state.commit_completion(
+            || CellEvent::Completed {
+                content_items: output,
+                error_text: None,
+                result_buffered_for: Duration::ZERO,
+            },
+            || {}
+        ),
+        CompletionCommit::Committed
+    );
+    let (command_tx, _command_rx) = mpsc::unbounded_channel();
+    let handle = CellHandle::new(command_tx, state);
+    let snapshot = handle.snapshot().unwrap().unwrap();
+    assert!(snapshot.output_collector.is_some());
+    let snapshot = serde_json::from_value(serde_json::to_value(snapshot).unwrap()).unwrap();
+    let restored = CellHandle::restored(snapshot, CancellationToken::new()).unwrap();
+    let CellEvent::Completed {
+        content_items,
+        error_text,
+        ..
+    } = restored
+        .observe(ObserveMode::PendingFrontier)
+        .await
+        .unwrap()
+    else {
+        panic!("expected restored completion");
+    };
+    assert_eq!(error_text, None);
+    assert_eq!(
+        crate::output::render_output(content_items.into_collected_output(), Some(128)),
+        expected
+    );
+}
+
+#[tokio::test]
+async fn legacy_snapshot_preserves_initial_yield_output() {
+    let snapshot = serde_json::from_value(serde_json::json!({
+        "public_cell_id": "g2:1",
+        "pending_initial_yield_items": [{"Text": {"text": "before"}}],
+        "event": {"Completed": {"content_items": [{"Text": {"text": "after"}}], "error_text": null}}
+    }))
+    .unwrap();
+    let restored = CellHandle::restored(snapshot, CancellationToken::new()).unwrap();
+    let CellEvent::Completed { content_items, .. } = restored
+        .observe(ObserveMode::PendingFrontier)
+        .await
+        .unwrap()
+    else {
+        panic!("expected restored completion");
+    };
+    assert_eq!(
+        content_items,
+        OutputCollector::Client(vec![
+            OutputItem::InputText {
+                text: "before".to_string()
+            },
+            OutputItem::InputText {
+                text: "after".to_string()
+            },
+        ])
+    );
+}

@@ -6,6 +6,7 @@ mod process_metrics;
 mod response;
 mod runtime;
 mod session;
+mod snapshot;
 
 pub use description::CODE_MODE_PRAGMA_PREFIX;
 pub use description::CodeModeToolKind;
@@ -57,6 +58,11 @@ pub use session::NoopCodeModeSessionDelegate;
 pub use session::NotificationFuture;
 pub use session::StartedCell;
 pub use session::ToolInvocationFuture;
+pub use snapshot::CodeModeSnapshot;
+pub use snapshot::CompletedCellSnapshot;
+pub use snapshot::SnapshotCellEvent;
+pub use snapshot::SnapshotImageDetail;
+pub use snapshot::SnapshotOutputItem;
 
 pub const PUBLIC_TOOL_NAME: &str = "exec";
 pub const WAIT_TOOL_NAME: &str = "wait";

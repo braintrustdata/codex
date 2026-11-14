@@ -10,6 +10,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::CodeModeNestedToolCall;
+use crate::CodeModeSnapshot;
 use crate::ExecuteRequest;
 use crate::RuntimeResponse;
 use crate::TerminateRequest;
@@ -187,6 +188,16 @@ pub trait CodeModeSession: Send + Sync {
         CodeModeOutputTruncation::Client
     }
 
+    /// Copies committed state without running or cancelling any cell.
+    fn export_state(&self) -> CodeModeSessionResultFuture<'_, CodeModeSnapshot> {
+        Box::pin(async { Err("code-mode state transfer is unsupported".to_string()) })
+    }
+
+    /// Installs state before any execution in a fresh session.
+    fn import_state(&self, _state: CodeModeSnapshot) -> CodeModeSessionResultFuture<'_, ()> {
+        Box::pin(async { Err("code-mode state transfer is unsupported".to_string()) })
+    }
+
     /// Executes a cell, yielding its foreground observation if `preempt` is signaled.
     /// The cell continues running after its observation yields.
     fn execute<'a>(
@@ -235,6 +246,14 @@ pub trait CodeModeSessionProvider: Send + Sync {
     }
 
     fn create_session(&self) -> CodeModeSessionProviderFuture<'_>;
+
+    /// Creates the isolated runtime owned by this native thread.
+    fn create_session_for_thread(
+        &self,
+        _thread_id: codex_protocol::ThreadId,
+    ) -> CodeModeSessionProviderFuture<'_> {
+        self.create_session()
+    }
 
     /// Creates a session whose cells share the supplied execution limits.
     ///

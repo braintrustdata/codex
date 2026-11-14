@@ -21,7 +21,7 @@ pub(crate) const MAX_SERVER_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 
 /// The actor transfers the whole collector at each observation, so a failed
 /// synchronous send can restore the original state, including any omissions.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(test, derive(PartialEq))]
 pub(crate) enum OutputCollector {
     Client(Vec<OutputItem>),
@@ -131,7 +131,7 @@ struct OutputGap {
     omitted: OutputOmission,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 struct OutputOmission {
     text_bytes: u64,
     text_items: u64,
