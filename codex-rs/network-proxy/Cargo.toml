@@ -45,14 +45,23 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 url = { workspace = true }
 rama-core = { version = "=0.3.0-alpha.4" }
+rama-error = { version = "=0.3.0-alpha.4" }
 rama-http = { version = "=0.3.0-alpha.4" }
 rama-http-backend = { version = "=0.3.0-alpha.4", features = ["tls"] }
+rama-macros = { version = "=0.3.0-alpha.4" }
 rama-net = { version = "=0.3.0-alpha.4", features = ["http", "tls"] }
 rama-socks5 = { version = "=0.3.0-alpha.4" }
 rama-tcp = { version = "=0.3.0-alpha.4", features = ["http"] }
 rama-tls-rustls = { version = "=0.3.0-alpha.4", features = ["http"] }
+rama-utils = { version = "=0.3.0-alpha.4" }
 rustls-native-certs = { workspace = true }
 sha2 = { workspace = true }
+
+# rama-core 0.3.0-alpha.4 accepts rama-error, rama-macros, and rama-utils
+# 0.3.0, which removed APIs it imports. Pin them for consumers that resolve
+# their own lockfile until the Rama upgrade.
+[package.metadata.cargo-shear]
+ignored = ["rama-error", "rama-macros", "rama-utils"]
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
