@@ -1033,6 +1033,16 @@ impl CodexThread {
         Ok(())
     }
 
+    /// Whether Core requires Guardian approval before emitting a request for this dynamic tool.
+    pub fn requires_guardian_review_for_dynamic_tool(
+        &self,
+        tool: &codex_protocol::ToolName,
+    ) -> bool {
+        self.thread_extension_data()
+            .get::<crate::tools::native_tool_review::DynamicToolReviewPolicy>()
+            .is_some_and(|policy| policy.reviews(tool))
+    }
+
     /// Review the final injected tool call without executing it.
     pub async fn guardian_review(
         &self,

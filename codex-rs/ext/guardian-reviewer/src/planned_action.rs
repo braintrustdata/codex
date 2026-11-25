@@ -12,18 +12,19 @@ pub fn build_guardian_planned_action(
     reason: Option<String>,
 ) -> serde_json::Result<PlannedAction> {
     Ok(PlannedAction {
-        tool_descriptions: if let GuardianApprovalRequest::McpToolCall {
-            tool_description,
-            connector_description,
-            ..
-        } = request
-        {
-            GuardianToolDescriptions::new(
+        tool_descriptions: match request {
+            GuardianApprovalRequest::McpToolCall {
+                tool_description,
+                connector_description,
+                ..
+            } => GuardianToolDescriptions::new(
                 tool_description.as_deref(),
                 connector_description.as_deref(),
-            )
-        } else {
-            None
+            ),
+            GuardianApprovalRequest::DynamicToolCall {
+                tool_description, ..
+            } => GuardianToolDescriptions::new(tool_description.as_deref(), None),
+            _ => None,
         },
         kind: match request {
             GuardianApprovalRequest::NativeToolCall { call, .. } => {
@@ -39,6 +40,7 @@ pub fn build_guardian_planned_action(
             GuardianApprovalRequest::ExecCommand { .. }
             | GuardianApprovalRequest::ApplyPatch { .. }
             | GuardianApprovalRequest::McpToolCall { .. }
+            | GuardianApprovalRequest::DynamicToolCall { .. }
             | GuardianApprovalRequest::RequestPermissions { .. } => PlannedActionKind::Command {
                 json: format_guardian_action_pretty(request)?,
             },

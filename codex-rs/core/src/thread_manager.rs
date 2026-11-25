@@ -401,6 +401,16 @@ impl ThreadInstructionsProvider for InheritedThreadInstructions {
 }
 
 impl StartThreadOptions {
+    /// Require Guardian approval for these dynamic tools before Core dispatches them.
+    /// This host policy is thread-local and must be supplied again when cold-resuming.
+    pub fn set_guardian_reviewed_dynamic_tools(
+        &mut self,
+        tools: impl IntoIterator<Item = codex_protocol::ToolName>,
+    ) {
+        self.thread_extension_init
+            .insert(crate::tools::native_tool_review::DynamicToolReviewPolicy::new(tools));
+    }
+
     fn effective_sources(
         &self,
         default_source: &SessionSource,

@@ -21,6 +21,12 @@ pub enum GuardianApprovalRequest {
         id: String,
         call: Box<codex_protocol::models::ResponseItem>,
     },
+    DynamicToolCall {
+        id: String,
+        tool: codex_protocol::ToolName,
+        arguments: Value,
+        tool_description: Option<String>,
+    },
     ExecCommand {
         id: String,
         environment_id: String,
@@ -107,7 +113,9 @@ impl GuardianApprovalRequest {
             | Self::ApplyPatch { environment_id, .. }
             | Self::RequestPermissions { environment_id, .. }
             | Self::NetworkAccess { environment_id, .. } => Some(environment_id),
-            Self::McpToolCall { .. } | Self::NativeToolCall { .. } => None,
+            Self::McpToolCall { .. }
+            | Self::NativeToolCall { .. }
+            | Self::DynamicToolCall { .. } => None,
         }
     }
 }
@@ -146,7 +154,7 @@ impl GuardianApprovalRequest {
             Self::McpToolCall { server, .. } => GuardianScope::for_mcp_server(server),
             Self::NetworkAccess { .. } => GuardianScope::Network,
             Self::RequestPermissions { .. } => GuardianScope::Permissions,
-            Self::NativeToolCall { .. } => GuardianScope::NativeTool,
+            Self::NativeToolCall { .. } | Self::DynamicToolCall { .. } => GuardianScope::NativeTool,
         }
     }
 }
@@ -167,7 +175,8 @@ pub fn guardian_assessment_action(
     action: &GuardianApprovalRequest,
 ) -> Option<GuardianAssessmentAction> {
     Some(match action {
-        GuardianApprovalRequest::NativeToolCall { .. } => return None,
+        GuardianApprovalRequest::NativeToolCall { .. }
+        | GuardianApprovalRequest::DynamicToolCall { .. } => return None,
         GuardianApprovalRequest::ExecCommand {
             command,
             guardian_cwd,
@@ -233,7 +242,10 @@ pub fn guardian_assessment_action(
 
 pub fn guardian_reviewed_action(request: &GuardianApprovalRequest) -> GuardianReviewedAction {
     match request {
-        GuardianApprovalRequest::NativeToolCall { .. } => GuardianReviewedAction::NativeToolCall {},
+        GuardianApprovalRequest::NativeToolCall { .. }
+        | GuardianApprovalRequest::DynamicToolCall { .. } => {
+            GuardianReviewedAction::NativeToolCall {}
+        }
         GuardianApprovalRequest::ExecCommand {
             sandbox_permissions,
             additional_permissions,
@@ -281,7 +293,8 @@ pub fn guardian_request_target_item_id(request: &GuardianApprovalRequest) -> Opt
         | GuardianApprovalRequest::ApplyPatch { id, .. }
         | GuardianApprovalRequest::McpToolCall { id, .. }
         | GuardianApprovalRequest::RequestPermissions { id, .. }
-        | GuardianApprovalRequest::NativeToolCall { id, .. } => Some(id),
+        | GuardianApprovalRequest::NativeToolCall { id, .. }
+        | GuardianApprovalRequest::DynamicToolCall { id, .. } => Some(id),
         GuardianApprovalRequest::NetworkAccess { .. } => None,
     }
 }
@@ -297,7 +310,8 @@ pub fn guardian_request_turn_id<'a>(
         | GuardianApprovalRequest::WriteStdin { .. }
         | GuardianApprovalRequest::ApplyPatch { .. }
         | GuardianApprovalRequest::McpToolCall { .. }
-        | GuardianApprovalRequest::NativeToolCall { .. } => default_turn_id,
+        | GuardianApprovalRequest::NativeToolCall { .. }
+        | GuardianApprovalRequest::DynamicToolCall { .. } => default_turn_id,
     }
 }
 

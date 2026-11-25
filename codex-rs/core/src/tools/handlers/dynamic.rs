@@ -6,6 +6,8 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::parse_arguments;
+use crate::tools::native_tool_review::DynamicToolReviewPolicy;
+use crate::tools::native_tool_review::review_dynamic_tool_call;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::registry::ToolExposure;
@@ -124,16 +126,7 @@ impl DynamicToolHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
-        let ToolInvocation {
-            session,
-            turn,
-            call_id,
-            payload,
-            cancellation_token,
-            ..
-        } = invocation;
-
-        let arguments = match payload {
+        let arguments = match &invocation.payload {
             ToolPayload::Function { arguments } => arguments,
             _ => {
                 return Err(FunctionCallError::RespondToModel(
@@ -142,7 +135,31 @@ impl DynamicToolHandler {
             }
         };
 
-        let args: Value = parse_arguments(&arguments)?;
+        let args: Value = parse_arguments(arguments)?;
+        if invocation
+            .session
+            .services
+            .thread_extension_data
+            .get::<DynamicToolReviewPolicy>()
+            .is_some_and(|policy| policy.reviews(&self.tool_name))
+        {
+            let description = match &self.spec {
+                ToolSpec::Function(tool) => Some(tool.description.clone()),
+                ToolSpec::Namespace(namespace) => match namespace.tools.as_slice() {
+                    [ResponsesApiNamespaceTool::Function(tool)] => Some(tool.description.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            review_dynamic_tool_call(&invocation, &args, description).await?;
+        }
+        let ToolInvocation {
+            session,
+            turn,
+            call_id,
+            cancellation_token,
+            ..
+        } = invocation;
         let response = request_dynamic_tool(
             &session,
             turn.as_ref(),

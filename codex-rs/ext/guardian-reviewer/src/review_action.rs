@@ -25,6 +25,7 @@ impl From<GuardianApprovalRequest> for ReviewAction {
             | GuardianApprovalRequest::ApplyPatch { .. }
             | GuardianApprovalRequest::NetworkAccess { .. }
             | GuardianApprovalRequest::McpToolCall { .. }
+            | GuardianApprovalRequest::DynamicToolCall { .. }
             | GuardianApprovalRequest::RequestPermissions { .. }
             | GuardianApprovalRequest::NativeToolCall { .. } => {
                 guardian_request_target_item_id(&request).map(str::to_owned)

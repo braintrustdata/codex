@@ -71,6 +71,7 @@ pub(crate) fn decide_approval(
                 | GuardianApprovalRequest::WriteStdin { .. }
                 | GuardianApprovalRequest::ApplyPatch { .. }
                 | GuardianApprovalRequest::McpToolCall { .. }
+                | GuardianApprovalRequest::DynamicToolCall { .. }
                 | GuardianApprovalRequest::NativeToolCall { .. }
                 | GuardianApprovalRequest::RequestPermissions { .. },
             )
@@ -113,7 +114,10 @@ pub(crate) fn decide_approval(
                 .approvals_reviewer
                 .can_set(&codex_protocol::config_types::ApprovalsReviewer::User)
                 .is_err();
-        let full_access = context.environments().has_full_access(
+        let full_access = !matches!(
+            request.request,
+            Ok(GuardianApprovalRequest::DynamicToolCall { .. })
+        ) && context.environments().has_full_access(
             context.approval_policy,
             &turn.config.permissions.effective_permission_profile(),
         );
