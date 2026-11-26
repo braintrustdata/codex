@@ -26,6 +26,7 @@ pub(in crate::guardian) struct ApprovalEvidence {
 }
 
 /// Authorization captured before an attempt, checked while the reviewer is still reserved.
+#[derive(Clone)]
 pub(in crate::guardian) struct ReviewAuthorization {
     user_message_revision: u64,
     review_context_revision: u64,

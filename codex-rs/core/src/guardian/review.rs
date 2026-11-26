@@ -21,6 +21,7 @@ use codex_guardian_reviewer::run_before_review_deadline;
 use codex_guardian_reviewer::run_with_retry;
 use codex_prompts::ResolvedModelMessages;
 use codex_protocol::openai_models::GuardianScope;
+use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ReviewDecision;
 use std::sync::Arc;
@@ -153,6 +154,7 @@ pub(super) async fn guardian_review_session_config(
     })
 }
 
+#[derive(Clone)]
 struct ReviewAttemptOptions {
     authorization: Option<ReviewAuthorization>,
     external_cancel: Option<CancellationToken>,
@@ -251,6 +253,53 @@ impl ReviewInput {
 /// read-only checks, but it intentionally runs without inherited exec-policy
 /// rules.
 async fn run_guardian_review_session_before_deadline(
+    session: Arc<Session>,
+    mut context: GuardianReviewContext,
+    request: GuardianApprovalRequest,
+    category: GuardianScope,
+    reasons: ApprovalRequestReasons,
+    options: ReviewAttemptOptions,
+) -> (GuardianReviewOutcome, GuardianReviewAnalyticsResult) {
+    loop {
+        let (outcome, analytics) = Box::pin(run_guardian_review_session_attempt(
+            Arc::clone(&session),
+            context.clone(),
+            request.clone(),
+            category,
+            reasons.clone(),
+            options.clone(),
+        ))
+        .await;
+        if !matches!(request, GuardianApprovalRequest::DynamicToolCall { .. })
+            || !matches!(
+                outcome,
+                GuardianReviewOutcome::Error(GuardianReviewError::Session {
+                    error_info: Some(
+                        CodexErrorInfo::ModelNotFound
+                            | CodexErrorInfo::HttpConnectionFailed {
+                                http_status_code: Some(404),
+                            }
+                            | CodexErrorInfo::ResponseStreamConnectionFailed {
+                                http_status_code: Some(404),
+                            }
+                    ),
+                    ..
+                })
+            )
+            || !context
+                .model_info
+                .auto_review_model_override
+                .as_deref()
+                .is_some_and(|model| model != context.model_info.slug)
+        {
+            return (outcome, analytics);
+        }
+        let model = Arc::make_mut(&mut Arc::make_mut(&mut context.model_info).model);
+        model.auto_review_model_override = Some(model.slug.clone());
+    }
+}
+
+async fn run_guardian_review_session_attempt(
     session: Arc<Session>,
     context: GuardianReviewContext,
     request: GuardianApprovalRequest,
