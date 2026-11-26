@@ -324,6 +324,7 @@ pub enum DynamicToolCallStatus {
     InProgress,
     Completed,
     Failed,
+    Rejected,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]

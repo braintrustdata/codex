@@ -11,6 +11,7 @@ use crate::tools::native_tool_review::review_dynamic_tool_call;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::registry::ToolExposure;
+use crate::turn_timing::now_unix_timestamp_ms;
 use codex_async_utils::OrCancelExt;
 use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
@@ -143,6 +144,8 @@ impl DynamicToolHandler {
             .get::<DynamicToolReviewPolicy>()
             .is_some_and(|policy| policy.reviews(&self.tool_name))
         {
+            let started_at = Instant::now();
+            let started_at_ms = now_unix_timestamp_ms();
             let description = match &self.spec {
                 ToolSpec::Function(tool) => Some(tool.description.clone()),
                 ToolSpec::Namespace(namespace) => match namespace.tools.as_slice() {
@@ -151,7 +154,31 @@ impl DynamicToolHandler {
                 },
                 _ => None,
             };
-            review_dynamic_tool_call(&invocation, &args, description).await?;
+            if let Err(error) = review_dynamic_tool_call(&invocation, &args, description).await {
+                invocation
+                    .turn
+                    .turn_timing_state
+                    .record_item_started(invocation.call_id.clone(), started_at_ms)
+                    .await;
+                invocation
+                    .session
+                    .emit_turn_item_completed(
+                        &invocation.turn,
+                        TurnItem::DynamicToolCall(DynamicToolCallItem {
+                            id: invocation.call_id,
+                            namespace: self.tool_name.namespace.clone(),
+                            tool: self.tool_name.name.clone(),
+                            arguments: args,
+                            status: DynamicToolCallStatus::Rejected,
+                            content_items: None,
+                            success: Some(false),
+                            error: Some(error.to_string()),
+                            duration: Some(started_at.elapsed()),
+                        }),
+                    )
+                    .await;
+                return Err(error);
+            }
         }
         let ToolInvocation {
             session,

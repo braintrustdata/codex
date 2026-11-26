@@ -1309,7 +1309,7 @@ impl From<CoreDynamicToolCallStatus> for DynamicToolCallStatus {
         match value {
             CoreDynamicToolCallStatus::InProgress => Self::InProgress,
             CoreDynamicToolCallStatus::Completed => Self::Completed,
-            CoreDynamicToolCallStatus::Failed => Self::Failed,
+            CoreDynamicToolCallStatus::Failed | CoreDynamicToolCallStatus::Rejected => Self::Failed,
         }
     }
 }

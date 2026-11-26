@@ -3779,6 +3779,10 @@ fn dynamic_tool_call_outcome(
             ToolItemTerminalStatus::Failed,
             Some(ToolItemFailureKind::ToolError),
         )),
+        DynamicToolCallStatus::Rejected => Some((
+            ToolItemTerminalStatus::Rejected,
+            Some(ToolItemFailureKind::ApprovalDenied),
+        )),
     }
 }
 
